@@ -36,9 +36,14 @@ import (
 
 	"github.com/uber/cadence/common"
 	"github.com/uber/cadence/common/clock"
+	"github.com/uber/cadence/common/dynamicconfig"
 	"github.com/uber/cadence/common/log/loggerimpl"
+	"github.com/uber/cadence/common/log/tag"
+	"github.com/uber/cadence/common/log/testlogger"
+	"github.com/uber/cadence/common/metrics"
 	"github.com/uber/cadence/common/persistence"
 	"github.com/uber/cadence/common/types"
+	"github.com/uber/cadence/common/types/testdata"
 	"github.com/uber/cadence/service/history/config"
 	"github.com/uber/cadence/service/history/constants"
 	"github.com/uber/cadence/service/history/shard"
@@ -447,4 +452,453 @@ func TestReplicateDecisionTaskStartedEvent(t *testing.T) {
 		assert.Equal(t, fmt.Sprintf("unable to find decision: %v", scheduleID), err.Error())
 
 	})
+}
+
+func TestReplicateDecisionTaskTimedOutEvent(t *testing.T) {
+	core, observedLogs := observer.New(zap.DebugLevel)
+	m := &mutableStateDecisionTaskManagerImpl{
+		msb: &mutableStateBuilder{
+			executionInfo: &persistence.WorkflowExecutionInfo{
+				TaskList:       "some-taskList",
+				StickyTaskList: "some-sticky-taskList",
+			},
+			logger: loggerimpl.NewLogger(zap.New(core)),
+		},
+	}
+	event := &types.HistoryEvent{
+		DecisionTaskTimedOutEventAttributes: &types.DecisionTaskTimedOutEventAttributes{
+			TimeoutType: func(i int32) *types.TimeoutType {
+				timeout := new(types.TimeoutType)
+				*timeout = types.TimeoutType(i)
+				return timeout
+			}(1), // types.TimeoutTypeScheduleToStart
+			Cause: func(i int32) *types.DecisionTaskTimedOutCause {
+				cause := new(types.DecisionTaskTimedOutCause)
+				*cause = types.DecisionTaskTimedOutCause(i) // types.DecisionTaskTimedOutCauseReset
+				return cause
+			}(1),
+		},
+	}
+	err := m.ReplicateDecisionTaskTimedOutEvent(event)
+	require.NoError(t, err)
+	assert.Equal(t, 1, observedLogs.FilterMessage(fmt.Sprintf(
+		"Decision Updated: {Schedule: %v, Started: %v, ID: %v, Timeout: %v, Attempt: %v, Timestamp: %v}",
+		m.msb.executionInfo.DecisionScheduleID,
+		m.msb.executionInfo.DecisionStartedID,
+		m.msb.executionInfo.DecisionRequestID,
+		m.msb.executionInfo.DecisionTimeout,
+		m.msb.executionInfo.DecisionAttempt,
+		m.msb.executionInfo.DecisionStartedTimestamp,
+	)).Len())
+}
+
+func TestAddDecisionTaskScheduleToStartTimeoutEvent(t *testing.T) {
+	var scheduledID int64 = 1
+	tests := []struct {
+		name         string
+		assertions   func(t *testing.T, event *types.HistoryEvent, err error, logs *observer.ObservedLogs, m *mutableStateDecisionTaskManagerImpl)
+		expectations func(m *mutableStateDecisionTaskManagerImpl)
+		newMsb       func(t *testing.T) *mutableStateBuilder
+	}{
+		{
+			name: "success",
+			newMsb: func(t *testing.T) *mutableStateBuilder {
+				return &mutableStateBuilder{
+					executionInfo: &persistence.WorkflowExecutionInfo{
+						DecisionScheduleID: scheduledID,
+						DecisionAttempt:    int64(dynamicconfig.DecisionRetryCriticalAttempts),
+					},
+					timeSource:    clock.NewMockedTimeSource(),
+					domainEntry:   constants.TestLocalDomainEntry,
+					metricsClient: metrics.NewNoopMetricsClient(),
+				}
+			},
+			expectations: func(m *mutableStateDecisionTaskManagerImpl) {
+				m.msb.shard.(*shard.MockContext).EXPECT().GetConfig().Return(config.NewForTest())
+			},
+			assertions: func(t *testing.T, event *types.HistoryEvent, err error, observedLogs *observer.ObservedLogs, m *mutableStateDecisionTaskManagerImpl) {
+				assert.Equal(t, 1, observedLogs.FilterMessage("Critical error processing decision task, retrying.").Len())
+				assert.Equal(t, 1, observedLogs.FilterMessage(fmt.Sprintf(
+					"Decision Updated: {Schedule: %v, Started: %v, ID: %v, Timeout: %v, Attempt: %v, Timestamp: %v}",
+					m.msb.executionInfo.DecisionScheduleID,
+					m.msb.executionInfo.DecisionStartedID,
+					m.msb.executionInfo.DecisionRequestID,
+					m.msb.executionInfo.DecisionTimeout,
+					m.msb.executionInfo.DecisionAttempt,
+					m.msb.executionInfo.DecisionStartedTimestamp,
+				)).Len())
+			},
+		},
+		{
+			name: "failure",
+			newMsb: func(t *testing.T) *mutableStateBuilder {
+				return &mutableStateBuilder{
+					executionInfo: &persistence.WorkflowExecutionInfo{
+						DecisionStartedID: 1,
+					},
+				}
+			},
+			assertions: func(t *testing.T, event *types.HistoryEvent, err error, logs *observer.ObservedLogs, m *mutableStateDecisionTaskManagerImpl) {
+				require.Error(t, err)
+				assert.Equal(t, m.msb.createInternalServerError(tag.WorkflowActionDecisionTaskTimedOut), err)
+				assert.Nil(t, event)
+				assert.Equal(t, 1, logs.FilterMessage(mutableStateInvalidHistoryActionMsg).Len())
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			m := &mutableStateDecisionTaskManagerImpl{msb: test.newMsb(t)}
+			m.msb.hBuilder = NewHistoryBuilder(m.msb)
+			m.msb.shard = shard.NewMockContext(gomock.NewController(t))
+			core, _ := observer.New(zap.WarnLevel)
+			core, observedLogs := observer.New(zap.DebugLevel)
+			m.msb.logger = loggerimpl.NewLogger(zap.New(core))
+			if test.expectations != nil {
+				test.expectations(m)
+			}
+			event, err := m.AddDecisionTaskScheduleToStartTimeoutEvent(scheduledID)
+			test.assertions(t, event, err, observedLogs, m)
+		})
+	}
+}
+
+func TestAddDecisionTaskResetTimeoutEvent(t *testing.T) {
+	var scheduledID int64 = 1
+	var baseRunID string = testdata.RunID
+	var newRunID string = constants.TestRunID
+	var forkEventVersion int64 = 123
+	var reason string = "some-reason"
+	var resetRequestID string = testdata.RequestID
+
+	tests := []struct {
+		name         string
+		assertions   func(t *testing.T, event *types.HistoryEvent, err error, logs *observer.ObservedLogs, m *mutableStateDecisionTaskManagerImpl)
+		expectations func(m *mutableStateDecisionTaskManagerImpl)
+		newMsb       func(t *testing.T) *mutableStateBuilder
+	}{
+		{
+			name: "success",
+			newMsb: func(t *testing.T) *mutableStateBuilder {
+				return &mutableStateBuilder{
+					executionInfo: &persistence.WorkflowExecutionInfo{
+						DecisionScheduleID: scheduledID,
+						DecisionAttempt:    int64(dynamicconfig.DecisionRetryCriticalAttempts),
+					},
+					timeSource:       clock.NewMockedTimeSource(),
+					domainEntry:      constants.TestLocalDomainEntry,
+					metricsClient:    metrics.NewNoopMetricsClient(),
+					config:           config.NewForTest(),
+					workflowRequests: make(map[persistence.WorkflowRequest]struct{}),
+				}
+			},
+			expectations: func(m *mutableStateDecisionTaskManagerImpl) {
+				m.msb.shard.(*shard.MockContext).EXPECT().GetConfig().Return(config.NewForTest())
+			},
+			assertions: func(t *testing.T, event *types.HistoryEvent, err error, observedLogs *observer.ObservedLogs, m *mutableStateDecisionTaskManagerImpl) {
+				require.NoError(t, err)
+				require.NotNil(t, event)
+				assert.Equal(t, 1, observedLogs.FilterMessage("Critical error processing decision task, retrying.").Len())
+				assert.Equal(t, scheduledID, event.DecisionTaskTimedOutEventAttributes.ScheduledEventID)
+				assert.Equal(t, baseRunID, event.DecisionTaskTimedOutEventAttributes.BaseRunID)
+				assert.Equal(t, newRunID, event.DecisionTaskTimedOutEventAttributes.NewRunID)
+				assert.Equal(t, reason, event.DecisionTaskTimedOutEventAttributes.Reason)
+				assert.Equal(t, resetRequestID, event.DecisionTaskTimedOutEventAttributes.RequestID)
+				assert.Equal(t, forkEventVersion, event.DecisionTaskTimedOutEventAttributes.ForkEventVersion)
+
+			},
+		},
+		{
+			name: "internal server error",
+			newMsb: func(t *testing.T) *mutableStateBuilder {
+				return &mutableStateBuilder{
+					executionInfo: &persistence.WorkflowExecutionInfo{
+						DecisionScheduleID: 0,
+					},
+				}
+			},
+			assertions: func(t *testing.T, event *types.HistoryEvent, err error, logs *observer.ObservedLogs, m *mutableStateDecisionTaskManagerImpl) {
+				require.Error(t, err)
+				assert.Equal(t, m.msb.createInternalServerError(tag.WorkflowActionDecisionTaskTimedOut), err)
+				assert.Nil(t, event)
+				assert.Equal(t, 1, logs.FilterMessage(mutableStateInvalidHistoryActionMsg).Len())
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			m := &mutableStateDecisionTaskManagerImpl{msb: test.newMsb(t)}
+			m.msb.hBuilder = NewHistoryBuilder(m.msb)
+			m.msb.shard = shard.NewMockContext(gomock.NewController(t))
+			core, _ := observer.New(zap.WarnLevel)
+			core, observedLogs := observer.New(zap.DebugLevel)
+			m.msb.logger = loggerimpl.NewLogger(zap.New(core))
+			if test.expectations != nil {
+				test.expectations(m)
+			}
+			event, err := m.AddDecisionTaskResetTimeoutEvent(scheduledID, baseRunID, newRunID, forkEventVersion, reason, resetRequestID)
+			test.assertions(t, event, err, observedLogs, m)
+		})
+	}
+}
+
+func TestAddFirstDecisionTaskScheduled(t *testing.T) {
+	tests := []struct {
+		name         string
+		assertions   func(t *testing.T, err error)
+		expectations func(m *mutableStateDecisionTaskManagerImpl, event *types.HistoryEvent)
+		newMsb       func(t *testing.T) *mutableStateBuilder
+		event        *types.HistoryEvent
+	}{
+		{
+			name: "AddDecisionTaskScheduledEvent failure",
+			event: &types.HistoryEvent{
+				WorkflowExecutionStartedEventAttributes: &types.WorkflowExecutionStartedEventAttributes{},
+			},
+			expectations: func(m *mutableStateDecisionTaskManagerImpl, event *types.HistoryEvent) {
+				m.msb.shard.(*shard.MockContext).EXPECT().GenerateTransferTaskIDs(2).Return(nil, errors.New("some error"))
+			},
+			assertions: func(t *testing.T, err error) {
+				require.Error(t, err)
+				assert.Equal(t, "some error", err.Error())
+			},
+		},
+		{
+			name: "GenerateDelayedDecisionTasks failure",
+			event: &types.HistoryEvent{
+				WorkflowExecutionStartedEventAttributes: &types.WorkflowExecutionStartedEventAttributes{FirstDecisionTaskBackoffSeconds: func(i int32) *int32 { return &i }(100)},
+			},
+			expectations: func(m *mutableStateDecisionTaskManagerImpl, event *types.HistoryEvent) {
+				m.msb.taskGenerator.(*MockMutableStateTaskGenerator).EXPECT().GenerateDelayedDecisionTasks(event).Return(errors.New("some error"))
+			},
+			assertions: func(t *testing.T, err error) {
+				require.Error(t, err)
+				assert.Equal(t, "some error", err.Error())
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			m := &mutableStateDecisionTaskManagerImpl{
+				msb: &mutableStateBuilder{
+					executionInfo: &persistence.WorkflowExecutionInfo{
+						DecisionScheduleID: common.EmptyEventID,
+						StickyTaskList:     "some-sticky-tasklist",
+						DecisionStartedID:  1,
+					},
+					domainEntry:   constants.TestLocalDomainEntry,
+					shard:         shard.NewMockContext(ctrl),
+					taskGenerator: NewMockMutableStateTaskGenerator(ctrl),
+					timeSource:    clock.NewRealTimeSource(),
+					config:        config.NewForTest(),
+					logger:        testlogger.New(t),
+				},
+			}
+			m.msb.executionInfo.LastUpdatedTimestamp = m.msb.timeSource.Now()
+			m.msb.hBuilder = NewHistoryBuilder(m.msb)
+			m.msb.hBuilder.history = append(m.msb.hBuilder.history, &types.HistoryEvent{ID: common.BufferedEventID})
+			m.msb.hBuilder.transientHistory = append(m.msb.hBuilder.history, &types.HistoryEvent{})
+			m.msb.decisionTaskManager = m
+			if test.expectations != nil {
+				test.expectations(m, test.event)
+			}
+			err := m.AddFirstDecisionTaskScheduled(test.event)
+			test.assertions(t, err)
+		})
+	}
+}
+
+func TestAddDecisionTaskTimedOutEvent(t *testing.T) {
+	var scheduledID int64 = 1
+	var startedID int64 = 2
+	tests := []struct {
+		name       string
+		assertions func(t *testing.T, event *types.HistoryEvent, err error, logs *observer.ObservedLogs, m *mutableStateDecisionTaskManagerImpl)
+		newMsb     func(t *testing.T) *mutableStateBuilder
+	}{
+		{
+			name: "failure",
+			newMsb: func(t *testing.T) *mutableStateBuilder {
+				return &mutableStateBuilder{
+					executionInfo: &persistence.WorkflowExecutionInfo{
+						DecisionScheduleID: 0, // must be != scheduledID
+					},
+				}
+			},
+			assertions: func(t *testing.T, event *types.HistoryEvent, err error, logs *observer.ObservedLogs, m *mutableStateDecisionTaskManagerImpl) {
+				require.Error(t, err)
+				assert.Equal(t, m.msb.createInternalServerError(tag.WorkflowActionDecisionTaskTimedOut), err)
+				assert.Nil(t, event)
+				assert.Equal(t, 1, logs.FilterMessage(mutableStateInvalidHistoryActionMsg).Len())
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			m := &mutableStateDecisionTaskManagerImpl{msb: test.newMsb(t)}
+			core, observedLogs := observer.New(zap.WarnLevel)
+			m.msb.logger = loggerimpl.NewLogger(zap.New(core))
+			event, err := m.AddDecisionTaskTimedOutEvent(scheduledID, startedID)
+			test.assertions(t, event, err, observedLogs, m)
+		})
+	}
+}
+
+func TestAddDecisionTaskFailedEvent(t *testing.T) {
+	var scheduledID int64 = 1
+	var startedID int64 = 1
+	var forkEventVersion int64 = 123
+	baseRunID := testdata.RunID
+	newRunID := constants.TestRunID
+	resetRequestID := testdata.RequestID
+	cause := types.DecisionTaskFailedCause(0) // any
+	details := []byte("some-details")
+	identity := testdata.Identity
+	binChecksum := testdata.Checksum
+	reason := testdata.Reason
+
+	tests := []struct {
+		name         string
+		assertions   func(t *testing.T, event *types.HistoryEvent, err error, observedLogs *observer.ObservedLogs, m *mutableStateDecisionTaskManagerImpl)
+		expectations func(m *mutableStateDecisionTaskManagerImpl)
+		newMsb       func(t *testing.T) *mutableStateBuilder
+	}{
+		{
+			name: "success",
+			newMsb: func(t *testing.T) *mutableStateBuilder {
+				return &mutableStateBuilder{
+					executionInfo: &persistence.WorkflowExecutionInfo{
+						DecisionScheduleID: scheduledID,
+						DecisionStartedID:  startedID,
+					},
+					timeSource:       clock.NewMockedTimeSource(),
+					domainEntry:      constants.TestLocalDomainEntry,
+					metricsClient:    metrics.NewNoopMetricsClient(),
+					config:           config.NewForTest(),
+					workflowRequests: make(map[persistence.WorkflowRequest]struct{}),
+				}
+			},
+			expectations: func(m *mutableStateDecisionTaskManagerImpl) {
+				m.msb.shard.(*shard.MockContext).EXPECT().GetConfig().Return(config.NewForTest())
+			},
+			assertions: func(t *testing.T, event *types.HistoryEvent, err error, observedLogs *observer.ObservedLogs, m *mutableStateDecisionTaskManagerImpl) {
+				require.NoError(t, err)
+				require.NotNil(t, event)
+				assert.Equal(t, scheduledID, event.DecisionTaskFailedEventAttributes.ScheduledEventID)
+				assert.Equal(t, baseRunID, event.DecisionTaskFailedEventAttributes.BaseRunID)
+				assert.Equal(t, newRunID, event.DecisionTaskFailedEventAttributes.NewRunID)
+				assert.Equal(t, common.StringPtr(reason), event.DecisionTaskFailedEventAttributes.Reason)
+				assert.Equal(t, resetRequestID, event.DecisionTaskFailedEventAttributes.RequestID)
+				assert.Equal(t, forkEventVersion, event.DecisionTaskFailedEventAttributes.ForkEventVersion)
+
+			},
+		},
+		{
+			name: "internal server error",
+			newMsb: func(t *testing.T) *mutableStateBuilder {
+				return &mutableStateBuilder{
+					executionInfo: &persistence.WorkflowExecutionInfo{
+						DecisionScheduleID: 0, // must be != scheduledID
+					},
+				}
+			},
+			assertions: func(t *testing.T, event *types.HistoryEvent, err error, observedLogs *observer.ObservedLogs, m *mutableStateDecisionTaskManagerImpl) {
+				require.Error(t, err)
+				assert.Equal(t, m.msb.createInternalServerError(tag.WorkflowActionDecisionTaskFailed), err)
+				assert.Nil(t, event)
+				assert.Equal(t, 1, observedLogs.FilterMessage(mutableStateInvalidHistoryActionMsg).Len())
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			m := &mutableStateDecisionTaskManagerImpl{msb: test.newMsb(t)}
+			m.msb.hBuilder = NewHistoryBuilder(m.msb)
+			m.msb.shard = shard.NewMockContext(gomock.NewController(t))
+			core, observedLogs := observer.New(zap.WarnLevel)
+			m.msb.logger = loggerimpl.NewLogger(zap.New(core))
+			if test.expectations != nil {
+				test.expectations(m)
+			}
+			event, err := m.AddDecisionTaskFailedEvent(scheduledID, startedID, cause, details, identity, reason, binChecksum, baseRunID, newRunID, forkEventVersion, resetRequestID)
+			test.assertions(t, event, err, observedLogs, m)
+		})
+	}
+}
+
+func TestAddDecisionTaskCompletedEvent(t *testing.T) {
+	var scheduledID int64 = 1
+	var startedID int64 = 1
+	request := &types.RespondDecisionTaskCompletedRequest{}
+	maxResetPoints := 10
+
+	tests := []struct {
+		name         string
+		assertions   func(t *testing.T, event *types.HistoryEvent, err error, observedLogs *observer.ObservedLogs, m *mutableStateDecisionTaskManagerImpl)
+		expectations func(m *mutableStateDecisionTaskManagerImpl)
+		newMsb       func(t *testing.T) *mutableStateBuilder
+	}{
+		{
+			name: "success",
+			newMsb: func(t *testing.T) *mutableStateBuilder {
+				return &mutableStateBuilder{
+					executionInfo: &persistence.WorkflowExecutionInfo{
+						DecisionScheduleID: scheduledID,
+						DecisionStartedID:  startedID,
+						DecisionAttempt:    1,
+					},
+					timeSource:       clock.NewMockedTimeSource(),
+					domainEntry:      constants.TestLocalDomainEntry,
+					metricsClient:    metrics.NewNoopMetricsClient(),
+					config:           config.NewForTest(),
+					workflowRequests: make(map[persistence.WorkflowRequest]struct{}),
+				}
+			},
+			assertions: func(t *testing.T, event *types.HistoryEvent, err error, observedLogs *observer.ObservedLogs, m *mutableStateDecisionTaskManagerImpl) {
+				require.NoError(t, err)
+				require.NotNil(t, event)
+				assert.Equal(t, scheduledID, event.DecisionTaskCompletedEventAttributes.ScheduledEventID)
+				assert.Equal(t, startedID, event.DecisionTaskCompletedEventAttributes.StartedEventID)
+
+			},
+		},
+		{
+			name: "internal server error",
+			newMsb: func(t *testing.T) *mutableStateBuilder {
+				return &mutableStateBuilder{
+					executionInfo: &persistence.WorkflowExecutionInfo{
+						DecisionScheduleID: 0, // must be != scheduledID
+					},
+				}
+			},
+			assertions: func(t *testing.T, event *types.HistoryEvent, err error, observedLogs *observer.ObservedLogs, m *mutableStateDecisionTaskManagerImpl) {
+				require.Error(t, err)
+				assert.Equal(t, m.msb.createInternalServerError(tag.WorkflowActionDecisionTaskCompleted), err)
+				assert.Nil(t, event)
+				assert.Equal(t, 1, observedLogs.FilterMessage(mutableStateInvalidHistoryActionMsg).Len())
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			m := &mutableStateDecisionTaskManagerImpl{msb: test.newMsb(t)}
+			m.msb.hBuilder = NewHistoryBuilder(m.msb)
+			m.msb.shard = shard.NewMockContext(gomock.NewController(t))
+			core, _ := observer.New(zap.WarnLevel)
+			core, observedLogs := observer.New(zap.DebugLevel)
+			m.msb.logger = loggerimpl.NewLogger(zap.New(core))
+			if test.expectations != nil {
+				test.expectations(m)
+			}
+			event, err := m.AddDecisionTaskCompletedEvent(scheduledID, startedID, request, maxResetPoints)
+			test.assertions(t, event, err, observedLogs, m)
+		})
+	}
 }
